@@ -1,1 +1,1 @@
-See README_RENDER_SUPABASE.txt
+v2 free-text fields + built-in hourly scheduler

@@ -1,7 +1,9 @@
+-- Supabase SQL: run in SQL editor
 create table if not exists tickets (
   id bigserial primary key,
   created_at timestamptz default now(),
   asset_type text check (asset_type in ('truck','trailer','unspecified')) not null default 'unspecified',
+  asset_id text,
   problem text,
   plan text,
   eta timestamptz,
