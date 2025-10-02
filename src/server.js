@@ -1,3 +1,4 @@
+// v3.1 — command aliases + compact command menu
 import 'dotenv/config';
 import express from 'express';
 import axios from 'axios';
@@ -6,13 +7,11 @@ import { createClient } from '@supabase/supabase-js';
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
-// === ENV ===
 const TG = `https://api.telegram.org/bot${process.env.BOT_TOKEN}`;
 const GROUP_ID = process.env.GROUP_CHAT_ID;
 const ALLOW_ALL = process.env.ALLOW_ALL === '1';
 const supabase = createClient(process.env.SUPABASE_URL || '', process.env.SUPABASE_SERVICE_KEY || '', { auth: { persistSession: false }});
 
-// === helpers ===
 const csv = (s) => new Set((s||'').split(',').map(v=>v.trim()).filter(Boolean));
 const ALLOWED_USERNAMES = csv(process.env.ALLOWED_USERNAMES);
 const ALLOWED_USER_IDS  = csv(process.env.ALLOWED_USER_IDS);
@@ -42,19 +41,20 @@ async function toGroup(text, fileId){
 function helpText(){
   return [
     'Commands:',
-    '/new — create report',
+    '/report — create report (alias: /new)',
     '/submit — finish report creation',
-    '/my — list my open tickets',
-    '/update <id> — update ticket',
+    '/list — list my open tickets (alias: /my)',
+    '/update <id> — prepare to update ticket',
     '/status <id> <in_progress|awaiting_parts|vendor_scheduled|done>',
     '/eta <id> <YYYY-MM-DD HH:MM | +24h | +48h>',
     '/snooze <id> <hours>',
     '/addphoto <id> — next photo attaches to this ticket',
-    '/close <id> — close ticket (send /addphoto <id> then photo before closing to attach closing photo)',
+    '/close <id> — close ticket',
+    '/help — show this list'
   ].join('\n');
 }
 
-// === DB ===
+// DB helpers
 async function getSession(uid){
   const { data, error } = await supabase.from('sessions').select('*').eq('user_id', String(uid)).single();
   if (error && error.code !== 'PGRST116') console.log('getSession', error);
@@ -121,7 +121,6 @@ const ticketLine = (t)=>{
   return `#${t.id} • ${asset}${idtxt}${prob}${eta}`;
 };
 
-// === parsing ===
 function parseCmd(text) {
   const m = text.match(/^\/([a-z_]+)(?:\s+(.+))?$/i);
   if (!m) return null;
@@ -130,7 +129,7 @@ function parseCmd(text) {
   return { cmd, rest };
 }
 
-// === webhook ===
+// Webhook
 app.post('/', async (req,res)=>{
   const upd = req.body || {};
   try{
@@ -162,9 +161,12 @@ app.post('/', async (req,res)=>{
         }
       }
 
-      // command handling
       if (cmd){
-        const { cmd: c, rest } = cmd;
+        let { cmd: c, rest } = cmd;
+        // aliases
+        if (c === 'help') c = 'start';
+        if (c === 'report') c = 'new';
+        if (c === 'list') c = 'my';
 
         if (c === 'start'){
           await tg('sendMessage',{ chat_id: chat.id, text: helpText() });
@@ -187,7 +189,7 @@ app.post('/', async (req,res)=>{
             await toGroup(cap, d.photos?.[0]);
             await tg('sendMessage',{ chat_id: chat.id, text:`Ticket #${id} created.` });
           } else {
-            await tg('sendMessage',{ chat_id: chat.id, text:'Nothing to submit. Use /new to start.' });
+            await tg('sendMessage',{ chat_id: chat.id, text:'Nothing to submit. Use /report to start.' });
           }
           return res.send('OK');
         }
@@ -208,7 +210,7 @@ app.post('/', async (req,res)=>{
             return res.send('OK');
           }
           await setSession(from.id, 'update.active', { ticket_id:id });
-          await tg('sendMessage',{ chat_id: chat.id, text:`Ticket #${id}. Reply with:\n- status in_progress | awaiting_parts | vendor_scheduled | done\n- eta YYYY-MM-DD HH:MM | +24h | +48h\n- snooze 2\n- /addphoto ${id} (then send photo)` });
+          await tg('sendMessage',{ chat_id: chat.id, text:`Ticket #${id}. Reply with:\n- /status ${id} in_progress | awaiting_parts | vendor_scheduled | done\n- /eta ${id} YYYY-MM-DD HH:MM | +24h | +48h\n- /snooze ${id} 2\n- /addphoto ${id} then send photo` });
           return res.send('OK');
         }
 
@@ -285,7 +287,7 @@ app.post('/', async (req,res)=>{
         // unknown command
         await tg('sendMessage',{ chat_id: chat.id, text:'Unknown command.\n\n'+helpText() });
         return res.send('OK');
-      } // end if cmd
+      }
 
       // free text within create flow
       const ses = await getSession(from.id);
@@ -344,7 +346,7 @@ app.post('/', async (req,res)=>{
         return res.send('OK');
       }
 
-      await tg('sendMessage',{ chat_id: chat.id, text: 'Use /start to see commands.' });
+      await tg('sendMessage',{ chat_id: chat.id, text: 'Use /help to see commands.' });
       return res.send('OK');
     }
 
@@ -355,43 +357,36 @@ app.post('/', async (req,res)=>{
   }
 });
 
-// === Hourly reminders (built-in) ===
+// Hourly reminders + /cron
 async function remindersTick(){
   try{
     const h = new Date().getUTCHours();
-    if (h>=4 && h<=10) return; // quiet hours
+    if (h>=4 && h<=10) return;
     const { data: rows } = await supabase.from('tickets')
       .select('id, asset_type, asset_id, problem, eta, owner_user_id, last_reminded_at, snooze_until, status')
       .neq('status','done').order('id', { ascending:false }).limit(200);
-
     const due = (rows||[]).filter(t=>{
       const now = Date.now();
       if (t.snooze_until && new Date(t.snooze_until).getTime()>now) return false;
       if (t.last_reminded_at && (now - new Date(t.last_reminded_at).getTime()) < 55*60*1000) return false;
       return true;
     });
-
     for (const t of due){
       await tg('sendMessage', {
         chat_id: t.owner_user_id,
         text: `Update ticket #${t.id} (${t.asset_type}${t.asset_id? ' '+t.asset_id:''}${t.problem? ' • '+t.problem:''})${t.eta? ' • ETA: '+t.eta:''}\n` +
-              `Reply with:\n` +
-              `- /status ${t.id} in_progress | awaiting_parts | vendor_scheduled | done\n` +
-              `- /eta ${t.id} YYYY-MM-DD HH:MM | +24h | +48h\n` +
-              `- /snooze ${t.id} 2\n` +
-              `- /addphoto ${t.id} then send photo`
+              `Reply:\n/status ${t.id} in_progress | awaiting_parts | vendor_scheduled | done\n/eta ${t.id} YYYY-MM-DD HH:MM | +24h | +48h\n/snooze ${t.id} 2\n/addphoto ${t.id} (then photo)`
       });
       await supabase.from('tickets').update({ last_reminded_at: nowIso() }).eq('id', t.id);
       await sleep(150);
     }
   }catch(e){ console.log('remindersTick error', e?.response?.data || e); }
 }
-
 setTimeout(()=>{ remindersTick(); setInterval(remindersTick, 60*60*1000); }, 2*60*1000);
 app.get('/cron', async (_req,res)=>{ await remindersTick(); res.json({ ok:true }); });
 
 // health
-app.get('/', (_req,res)=> res.json({ ok:true, service:'fleet-repair-bot', time: nowIso() }));
+app.get('/', (_req,res)=> res.json({ ok:true, service:'fleet-repair-bot', ver:'3.1', time: nowIso() }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, ()=> console.log(`Listening on :${PORT}`));
