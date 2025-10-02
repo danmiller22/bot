@@ -1,4 +1,3 @@
--- Supabase SQL: run in SQL editor
 create table if not exists tickets (
   id bigserial primary key,
   created_at timestamptz default now(),
