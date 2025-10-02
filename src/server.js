@@ -16,9 +16,6 @@ const supabase = createClient(process.env.SUPABASE_URL || '', process.env.SUPABA
 const csv = (s) => new Set((s||'').split(',').map(v=>v.trim()).filter(Boolean));
 const ALLOWED_USERNAMES = csv(process.env.ALLOWED_USERNAMES);
 const ALLOWED_USER_IDS  = csv(process.env.ALLOWED_USER_IDS);
-
-const kb  = (rows)=>({ inline_keyboard: rows });
-const btn = (text,data)=>({ text, callback_data: data });
 const upper = (s)=>!s? s : s[0].toUpperCase()+s.slice(1);
 const nowIso = ()=> new Date().toISOString();
 const sleep = (ms)=> new Promise(r=>setTimeout(r,ms));
@@ -42,27 +39,32 @@ async function toGroup(text, fileId){
   return tg('sendMessage', { chat_id: GROUP_ID, text, parse_mode: 'HTML' });
 }
 
-function mainMenu(){
-  return kb([
-    [btn('Create report','cmd:new'), btn('Update status','cmd:update')],
-    [btn('Close report','cmd:close'), btn('My open tickets','cmd:my')]
-  ]);
+function helpText(){
+  return [
+    'Commands:',
+    '/new — create report',
+    '/submit — finish report creation',
+    '/my — list my open tickets',
+    '/update <id> — update ticket',
+    '/status <id> <in_progress|awaiting_parts|vendor_scheduled|done>',
+    '/eta <id> <YYYY-MM-DD HH:MM | +24h | +48h>',
+    '/snooze <id> <hours>',
+    '/addphoto <id> — next photo attaches to this ticket',
+    '/close <id> — close ticket (send /addphoto <id> then photo before closing to attach closing photo)',
+  ].join('\n');
 }
 
-// === DB: sessions / tickets / photos / events ===
+// === DB ===
 async function getSession(uid){
-  if (!supabase) return null;
   const { data, error } = await supabase.from('sessions').select('*').eq('user_id', String(uid)).single();
   if (error && error.code !== 'PGRST116') console.log('getSession', error);
   return data || null;
 }
 async function setSession(uid, state, dataObj){
-  if (!supabase) return;
   const { error } = await supabase.from('sessions').upsert({ user_id: String(uid), state, data: dataObj||{}, updated_at: nowIso() });
   if (error) console.log('setSession', error);
 }
 async function clearSession(uid){
-  if (!supabase) return;
   const { error } = await supabase.from('sessions').delete().eq('user_id', String(uid));
   if (error) console.log('clearSession', error);
 }
@@ -70,6 +72,7 @@ async function clearSession(uid){
 async function createTicket(draft, owner){
   const { data, error } = await supabase.from('tickets').insert({
     asset_type: draft.asset_type || 'unspecified',
+    asset_id: draft.asset_id || null,
     problem: draft.problem || null,
     plan: draft.plan || null,
     eta: draft.eta || null,
@@ -105,267 +108,260 @@ async function snooze(ticket_id, hours, by){
 }
 async function myOpenTickets(uid, limit=15){
   const { data, error } = await supabase.from('tickets')
-    .select('id, asset_type, problem, plan, eta, status, needs_photos')
+    .select('id, asset_type, asset_id, problem, plan, eta, status, needs_photos')
     .neq('status','done').eq('owner_user_id', String(uid))
     .order('id', { ascending:false }).limit(limit);
   if (error) throw error; return data || [];
 }
 const ticketLine = (t)=>{
   const asset = upper(t.asset_type||'unspecified');
+  const idtxt = t.asset_id ? ` ${t.asset_id}` : '';
   const eta = t.eta ? ` • ETA: ${new Date(t.eta).toISOString()}` : '';
   const prob = t.problem ? ` • ${t.problem}` : '';
-  return `#${t.id} • ${asset}${prob}${eta}`;
+  return `#${t.id} • ${asset}${idtxt}${prob}${eta}`;
 };
 
-// === Webhook ===
+// === parsing ===
+function parseCmd(text) {
+  const m = text.match(/^\/([a-z_]+)(?:\s+(.+))?$/i);
+  if (!m) return null;
+  const cmd = m[1].toLowerCase();
+  const rest = (m[2]||'').trim();
+  return { cmd, rest };
+}
+
+// === webhook ===
 app.post('/', async (req,res)=>{
   const upd = req.body || {};
-  try {
-    // ---- messages ----
+  try{
     if (upd.message){
-      const m = upd.message, chat = m.chat || {}, from = m.from || {};
-      if (chat.type === 'private'){
-        if (!isAllowed(from)) { await tg('sendMessage',{ chat_id: chat.id, text:'Access denied.' }); return res.send('OK'); }
+      const m = upd.message, from = m.from || {}, chat = m.chat || {};
+      if (chat.type !== 'private') return res.send('OK');
+      if (!isAllowed(from)){ await tg('sendMessage',{ chat_id: chat.id, text:'Access denied.' }); return res.send('OK'); }
 
-        // photos during flows
-        if (m.photo){
+      const textRaw = (m.text||'').trim();
+      const text = textRaw.toLowerCase();
+      const cmd = parseCmd(textRaw);
+
+      // photos in flows or addphoto
+      if (m.photo){
+        const ses = await getSession(from.id);
+        const file_id = m.photo[m.photo.length-1].file_id;
+        if (ses?.state === 'create.photos.wait'){
+          const draft = ses.data || {}; draft.photos = draft.photos || []; draft.photos.push(file_id); draft.needs_photos = false;
+          await setSession(from.id, 'create.photos.wait', draft);
+          await tg('sendMessage',{ chat_id: chat.id, text:'Photo added. Send more or /submit or type skip.' });
+          return res.send('OK');
+        }
+        if (ses?.state === 'update.addphoto.wait'){
+          const ticket_id = ses.data?.ticket_id;
+          if (ticket_id) await addPhoto(ticket_id, file_id, false, from.id);
+          await clearSession(from.id);
+          await tg('sendMessage',{ chat_id: chat.id, text:'Photo attached.' });
+          return res.send('OK');
+        }
+      }
+
+      // command handling
+      if (cmd){
+        const { cmd: c, rest } = cmd;
+
+        if (c === 'start'){
+          await tg('sendMessage',{ chat_id: chat.id, text: helpText() });
+          return res.send('OK');
+        }
+
+        if (c === 'new'){
+          await setSession(from.id, 'create.asset.wait', { asset_type:'unspecified', asset_id:null, photos:[], needs_photos:true });
+          await tg('sendMessage',{ chat_id: chat.id, text: 'Where is the issue? Type: truck / trailer / skip' });
+          return res.send('OK');
+        }
+
+        if (c === 'submit'){
           const ses = await getSession(from.id);
-          if (ses?.state){
-            const file_id = m.photo[m.photo.length-1].file_id;
-            if (ses.state.startsWith('create.')){
-              const draft = ses.data || {}; draft.photos = draft.photos || []; draft.photos.push(file_id); draft.needs_photos = false;
-              await setSession(from.id, 'create.photos', draft);
-              await tg('sendMessage',{ chat_id: chat.id, text:'Photo added. Add more or press Submit.' });
-              return res.send('OK');
-            }
-            if (ses.state.startsWith('update.addphotos')){
-              const ticket_id = ses.data?.ticket_id;
-              if (ticket_id) await addPhoto(ticket_id, file_id, false, from.id);
-              await tg('sendMessage',{ chat_id: chat.id, text:'Photo attached.' });
-              await clearSession(from.id);
-              return res.send('OK');
-            }
-            if (ses.state.startsWith('close.photos')){
-              const draft = ses.data || {}; draft.photos = draft.photos || []; draft.photos.push(file_id);
-              await setSession(from.id, 'close.photos', draft);
-              await tg('sendMessage',{ chat_id: chat.id, text:'Closing photo added. Send more or press Close again.' });
-              return res.send('OK');
-            }
+          if (ses?.state?.startsWith('create.')){
+            const id = await createTicket(ses.data || {}, from.id);
+            await clearSession(from.id);
+            const d = ses.data || {};
+            const cap = `#${id} • ${upper(d.asset_type||'unspecified')}${d.asset_id? ' '+d.asset_id:''}${d.problem? ' • '+d.problem:''}\nPlan: ${d.plan||'Unspecified'}${d.eta? ' • ETA: '+d.eta:''}\nBy: @${from.username||from.id}`;
+            await toGroup(cap, d.photos?.[0]);
+            await tg('sendMessage',{ chat_id: chat.id, text:`Ticket #${id} created.` });
+          } else {
+            await tg('sendMessage',{ chat_id: chat.id, text:'Nothing to submit. Use /new to start.' });
           }
+          return res.send('OK');
         }
 
-        const text = (m.text||'').trim().toLowerCase();
-
-        if (text === '/start'){
-          await tg('sendMessage',{ chat_id: chat.id, text:'Select an action:', reply_markup: mainMenu() });
-          return res.send('OK');
-        }
-        if (text === '/new' || text === 'create report'){
-          await setSession(from.id, 'create.asset', { asset_type:'unspecified', needs_photos:true, photos:[] });
-          await tg('sendMessage',{ chat_id: chat.id, text:'Where is the issue?', reply_markup: kb([[btn('Truck','new:asset:truck'), btn('Trailer','new:asset:trailer')],[btn('Skip','new:asset:skip')]]) });
-          return res.send('OK');
-        }
-        if (text === '/update' || text === 'update status'){
-          const open = await myOpenTickets(from.id);
-          if (!open.length){ await tg('sendMessage',{ chat_id: chat.id, text:'No open tickets.' }); return res.send('OK'); }
-          const rows = open.map(t=>[btn(`#${t.id} ${t.asset_type} ${t.problem||''}`.trim(), `upd:pick:${t.id}`)]);
-          await setSession(from.id, 'update.pick', {});
-          await tg('sendMessage',{ chat_id: chat.id, text:'Select ticket to update:', reply_markup: kb(rows) });
-          return res.send('OK');
-        }
-        if (text === '/close' || text === 'close report'){
-          const open = await myOpenTickets(from.id);
-          if (!open.length){ await tg('sendMessage',{ chat_id: chat.id, text:'No open tickets.' }); return res.send('OK'); }
-          const rows = open.map(t=>[btn(`#${t.id} ${t.asset_type} ${t.problem||''}`.trim(), `close:pick:${t.id}`)]);
-          await setSession(from.id, 'close.pick', {});
-          await tg('sendMessage',{ chat_id: chat.id, text:'Select ticket to close:', reply_markup: kb(rows) });
-          return res.send('OK');
-        }
-        if (text === '/my' || text === 'my open tickets'){
-          const mine = await myOpenTickets(from.id, 15);
+        if (c === 'my'){
+          const mine = await myOpenTickets(from.id, 20);
           if (!mine.length) await tg('sendMessage',{ chat_id: chat.id, text:'No open tickets.' });
           else await tg('sendMessage',{ chat_id: chat.id, text: mine.map(ticketLine).join('\n') });
           return res.send('OK');
         }
 
-        await tg('sendMessage',{ chat_id: chat.id, text:'Use the menu:', reply_markup: mainMenu() });
-        return res.send('OK');
-      }
-      // ignore group text
-      return res.send('OK');
-    }
-
-    // ---- callbacks ----
-    if (upd.callback_query){
-      const cq = upd.callback_query, from = cq.from || {}, data = cq.data || '';
-      if (!isAllowed(from)){ await tg('answerCallbackQuery',{ callback_query_id: cq.id, text:'Access denied.' }); return res.send('OK'); }
-
-      // NEW
-      if (data === 'cmd:new'){
-        await setSession(from.id, 'create.asset', { asset_type:'unspecified', needs_photos:true, photos:[] });
-        await tg('sendMessage',{ chat_id: from.id, text:'Where is the issue?', reply_markup: kb([[btn('Truck','new:asset:truck'), btn('Trailer','new:asset:trailer')],[btn('Skip','new:asset:skip')]]) });
-        return res.send('OK');
-      }
-      if (data.startsWith('new:asset:')){
-        const choice = data.split(':')[2];
-        const ses = await getSession(from.id) || { data:{} };
-        const draft = ses.data || {}; draft.asset_type = (choice==='skip') ? 'unspecified' : choice;
-        await setSession(from.id, 'create.problem', draft);
-        await tg('sendMessage',{ chat_id: from.id, text:'Problem?', reply_markup: kb([
-          [btn('Tire','new:problem:Tire'), btn('Brakes','new:problem:Brakes'), btn('Electrical','new:problem:Electrical')],
-          [btn('Leak','new:problem:Leak'), btn('Engine','new:problem:Engine'), btn('Other','new:problem:other')],
-          [btn('Skip','new:problem:skip')]
-        ])});
-        return res.send('OK');
-      }
-      if (data.startsWith('new:problem:')){
-        const choice = data.split(':')[2];
-        const ses = await getSession(from.id) || { data:{} };
-        const draft = ses.data || {};
-        draft.problem = (choice==='skip' || choice==='other') ? 'Unspecified' : choice;
-        await setSession(from.id, 'create.plan', draft);
-        await tg('sendMessage',{ chat_id: from.id, text:'Action plan?', reply_markup: kb([
-          [btn('Mobile repair','new:plan:Mobile repair'), btn('Tow','new:plan:Tow')],
-          [btn('Shop appointment','new:plan:Shop appointment'), btn('Waiting for vendor','new:plan:Waiting for vendor')],
-          [btn('Other','new:plan:other'), btn('Skip','new:plan:skip')]
-        ])});
-        return res.send('OK');
-      }
-      if (data.startsWith('new:plan:')){
-        const choice = data.split(':')[2];
-        const ses = await getSession(from.id) || { data:{} };
-        const draft = ses.data || {};
-        draft.plan = (choice==='skip' || choice==='other') ? 'Unspecified' : choice;
-        await setSession(from.id, 'create.eta', draft);
-        await tg('sendMessage',{ chat_id: from.id, text:'ETA?', reply_markup: kb([
-          [btn('Today','new:eta:today'), btn('+24h','new:eta:+24h'), btn('+48h','new:eta:+48h')],
-          [btn('Set time…','new:eta:set'), btn('Skip','new:eta:skip')]
-        ])});
-        return res.send('OK');
-      }
-      if (data.startsWith('new:eta:')){
-        const choice = data.split(':')[2];
-        const ses = await getSession(from.id) || { data:{} };
-        const draft = ses.data || {};
-        if (choice === 'today'){ const d=new Date(); d.setHours(23,59,0,0); draft.eta = d.toISOString(); }
-        else if (choice === '+24h'){ draft.eta = new Date(Date.now()+24*3600*1000).toISOString(); }
-        else if (choice === '+48h'){ draft.eta = new Date(Date.now()+48*3600*1000).toISOString(); }
-        else if (choice === 'set'){ await setSession(from.id, 'create.eta.set', draft); await tg('sendMessage',{ chat_id: from.id, text:'Enter ETA (YYYY-MM-DD HH:MM)' }); return res.send('OK'); }
-        else if (choice === 'skip'){ draft.eta = null; }
-        await setSession(from.id, 'create.photos', draft);
-        await tg('sendMessage',{ chat_id: from.id, text:'Attach photos (required) or press Skip to mark as “needs photos”. Then Submit.', reply_markup: kb([[btn('Skip','new:photos:skip'), btn('Submit','new:submit')]]) });
-        return res.send('OK');
-      }
-      if (data === 'new:photos:skip' || data === 'new:submit'){
-        const ses = await getSession(from.id) || { data:{} };
-        const draft = ses.data || {};
-        if (data === 'new:photos:skip') draft.needs_photos = true;
-        const id = await createTicket(draft, from.id);
-        await clearSession(from.id);
-        const cap = `#${id} • ${upper(draft.asset_type||'unspecified')}${draft.problem? ' • '+draft.problem:''}\nPlan: ${draft.plan||'Unspecified'}${draft.eta? ' • ETA: '+draft.eta:''}\nBy: @${from.username||from.id}`;
-        const photo = draft.photos?.[0] || null;
-        await toGroup(cap, photo);
-        await tg('sendMessage',{ chat_id: from.id, text:`Ticket #${id} created.`, reply_markup: mainMenu() });
-        return res.send('OK');
-      }
-
-      // UPDATE
-      if (data === 'cmd:update'){
-        const open = await myOpenTickets(from.id);
-        if (!open.length){ await tg('sendMessage',{ chat_id: from.id, text:'No open tickets.' }); return res.send('OK'); }
-        await setSession(from.id, 'update.pick', {});
-        await tg('sendMessage',{ chat_id: from.id, text:'Select ticket to update:', reply_markup: kb(open.map(t=>[btn(`#${t.id} ${t.asset_type} ${t.problem||''}`.trim(), `upd:pick:${t.id}`)])) });
-        return res.send('OK');
-      }
-      if (data.startsWith('upd:pick:')){
-        const ticket_id = parseInt(data.split(':')[2],10);
-        await setSession(from.id, 'update.menu', { ticket_id });
-        const rows = [
-          [btn('In progress','upd:status:in_progress'), btn('Awaiting parts','upd:status:awaiting_parts')],
-          [btn('Vendor scheduled','upd:status:vendor_scheduled'), btn('Done','upd:status:done')],
-          [btn('Snooze 2h','upd:snooze:2h'), btn('Change ETA','upd:eta:set')],
-          [btn('Add photos','upd:photos:add')]
-        ];
-        await tg('sendMessage',{ chat_id: from.id, text:`Update ticket #${ticket_id}:`, reply_markup: kb(rows) });
-        return res.send('OK');
-      }
-      if (data.startsWith('upd:status:')){
-        const status = data.split(':')[2];
-        const ses = await getSession(from.id); const ticket_id = ses?.data?.ticket_id;
-        if (ticket_id){
-          if (status === 'done'){
-            await updateStatus(ticket_id, 'done', from.id);
-            await supabase.from('tickets').update({ closed_at: nowIso(), closed_by_user_id: String(from.id) }).eq('id', ticket_id);
-            await toGroup(`✅ #${ticket_id} • Closed • by @${from.username||from.id}`);
-            await tg('sendMessage',{ chat_id: from.id, text:`Ticket #${ticket_id} closed.` });
-          } else {
-            await updateStatus(ticket_id, status, from.id);
-            await toGroup(`#${ticket_id} • ${status.replace('_',' ')} • by @${from.username||from.id}`);
-            await tg('sendMessage',{ chat_id: from.id, text:'Status updated.' });
+        if (c === 'update'){
+          const id = parseInt(rest,10);
+          if (!id){
+            const mine = await myOpenTickets(from.id, 15);
+            if (!mine.length) await tg('sendMessage',{ chat_id: chat.id, text:'No open tickets.' });
+            else await tg('sendMessage',{ chat_id: chat.id, text: 'Usage: /update <id>\n' + mine.map(ticketLine).join('\n') });
+            return res.send('OK');
           }
+          await setSession(from.id, 'update.active', { ticket_id:id });
+          await tg('sendMessage',{ chat_id: chat.id, text:`Ticket #${id}. Reply with:\n- status in_progress | awaiting_parts | vendor_scheduled | done\n- eta YYYY-MM-DD HH:MM | +24h | +48h\n- snooze 2\n- /addphoto ${id} (then send photo)` });
+          return res.send('OK');
         }
-        await clearSession(from.id);
+
+        if (c === 'status'){
+          const [idStr, status] = rest.split(/\s+/,2);
+          const id = parseInt(idStr,10);
+          const st = (status||'').trim().toLowerCase();
+          const allowed = new Set(['in_progress','awaiting_parts','vendor_scheduled','done']);
+          if (!id || !allowed.has(st)){ await tg('sendMessage',{ chat_id: chat.id, text:'Usage: /status <id> <in_progress|awaiting_parts|vendor_scheduled|done>' }); return res.send('OK'); }
+          if (st === 'done'){
+            await updateStatus(id, 'done', from.id);
+            await supabase.from('tickets').update({ closed_at: nowIso(), closed_by_user_id: String(from.id) }).eq('id', id);
+            await toGroup(`✅ #${id} • Closed • by @${from.username||from.id}`);
+            await tg('sendMessage',{ chat_id: chat.id, text:`Ticket #${id} closed.` });
+          } else {
+            await updateStatus(id, st, from.id);
+            await toGroup(`#${id} • ${st.replace('_',' ')} • by @${from.username||from.id}`);
+            await tg('sendMessage',{ chat_id: chat.id, text:'Status updated.' });
+          }
+          return res.send('OK');
+        }
+
+        if (c === 'eta'){
+          const m = rest.match(/^(\d+)\s+(.+)$/);
+          if (!m){ await tg('sendMessage',{ chat_id: chat.id, text:'Usage: /eta <id> <YYYY-MM-DD HH:MM | +24h | +48h>' }); return res.send('OK'); }
+          const id = parseInt(m[1],10); let s = m[2].trim();
+          let dt = null;
+          if (s === '+24h') dt = new Date(Date.now()+24*3600*1000);
+          else if (s === '+48h') dt = new Date(Date.now()+48*3600*1000);
+          else {
+            s = s.replace('T',' ').replace('/', '-');
+            const tmp = new Date(s);
+            if (!isNaN(tmp.getTime())) dt = tmp;
+          }
+          if (!dt){ await tg('sendMessage',{ chat_id: chat.id, text:'Bad time format.' }); return res.send('OK'); }
+          await setETA(id, dt.toISOString(), from.id);
+          await toGroup(`#${id} • ETA set to ${dt.toISOString()} • by @${from.username||from.id}`);
+          await tg('sendMessage',{ chat_id: chat.id, text:'ETA updated.' });
+          return res.send('OK');
+        }
+
+        if (c === 'snooze'){
+          const m = rest.match(/^(\d+)\s+(\d+)h?$/i);
+          if (!m){ await tg('sendMessage',{ chat_id: chat.id, text:'Usage: /snooze <id> <hours>' }); return res.send('OK'); }
+          const id = parseInt(m[1],10); const hours = parseInt(m[2],10);
+          const until = await snooze(id, hours, from.id);
+          await tg('sendMessage',{ chat_id: chat.id, text:`Snoozed until ${until}` });
+          return res.send('OK');
+        }
+
+        if (c === 'addphoto'){
+          const id = parseInt(rest,10);
+          if (!id){ await tg('sendMessage',{ chat_id: chat.id, text:'Usage: /addphoto <id>' }); return res.send('OK'); }
+          await setSession(from.id, 'update.addphoto.wait', { ticket_id:id });
+          await tg('sendMessage',{ chat_id: chat.id, text:'Send photo now.' });
+          return res.send('OK');
+        }
+
+        if (c === 'close'){
+          const id = parseInt(rest,10);
+          if (!id){
+            const mine = await myOpenTickets(from.id, 15);
+            if (!mine.length) await tg('sendMessage',{ chat_id: chat.id, text:'No open tickets.' });
+            else await tg('sendMessage',{ chat_id: chat.id, text: 'Usage: /close <id>\n(Optional) attach photos via /addphoto <id> before closing.\n' + mine.map(ticketLine).join('\n') });
+            return res.send('OK');
+          }
+          await updateStatus(id, 'done', from.id);
+          await supabase.from('tickets').update({ closed_at: nowIso(), closed_by_user_id: String(from.id) }).eq('id', id);
+          await toGroup(`✅ #${id} • Closed • by @${from.username||from.id}`);
+          await tg('sendMessage',{ chat_id: chat.id, text:`Ticket #${id} closed.` });
+          return res.send('OK');
+        }
+
+        // unknown command
+        await tg('sendMessage',{ chat_id: chat.id, text:'Unknown command.\n\n'+helpText() });
+        return res.send('OK');
+      } // end if cmd
+
+      // free text within create flow
+      const ses = await getSession(from.id);
+      if (ses?.state === 'create.asset.wait'){
+        const v = text;
+        const asset = (v==='truck'||v==='trailer') ? v : (v==='skip' ? 'unspecified' : null);
+        if (!asset){ await tg('sendMessage',{ chat_id: chat.id, text:'Type: truck / trailer / skip' }); return res.send('OK'); }
+        await setSession(from.id, 'create.assetId.wait', { ...(ses.data||{}), asset_type: asset });
+        const label = asset==='truck' ? 'Truck #' : (asset==='trailer' ? 'Trailer #' : 'Asset #');
+        await tg('sendMessage',{ chat_id: chat.id, text:`Enter ${label} (or type skip).` });
         return res.send('OK');
       }
-      if (data === 'upd:eta:set'){
-        const ses = await getSession(from.id);
-        if (ses?.data) { await setSession(from.id, 'update.eta.set', ses.data); await tg('sendMessage',{ chat_id: from.id, text:'Enter new ETA (YYYY-MM-DD HH:MM)' }); }
+      if (ses?.state === 'create.assetId.wait'){
+        const v = text;
+        const asset_id = (v==='skip') ? null : (m.text||'').trim();
+        await setSession(from.id, 'create.problem.wait', { ...(ses.data||{}), asset_id });
+        await tg('sendMessage',{ chat_id: chat.id, text:'Describe the problem (free text). Or type skip.' });
         return res.send('OK');
       }
-      if (data === 'upd:photos:add'){
-        const ses = await getSession(from.id);
-        if (ses?.data) { await setSession(from.id, 'update.addphotos', ses.data); await tg('sendMessage',{ chat_id: from.id, text:'Send photo(s) to attach.' }); }
+      if (ses?.state === 'create.problem.wait'){
+        const v = text;
+        const problem = (v==='skip') ? 'Unspecified' : (m.text||'').trim();
+        await setSession(from.id, 'create.plan.wait', { ...(ses.data||{}), problem });
+        await tg('sendMessage',{ chat_id: chat.id, text:'Action plan? (free text). Or type skip.' });
+        return res.send('OK');
+      }
+      if (ses?.state === 'create.plan.wait'){
+        const v = text;
+        const plan = (v==='skip') ? 'Unspecified' : (m.text||'').trim();
+        await setSession(from.id, 'create.eta.wait', { ...(ses.data||{}), plan });
+        await tg('sendMessage',{ chat_id: chat.id, text:'ETA? (YYYY-MM-DD HH:MM | +24h | +48h | skip)' });
+        return res.send('OK');
+      }
+      if (ses?.state === 'create.eta.wait'){
+        let eta = null;
+        if (text !== 'skip'){
+          if (text === '+24h') eta = new Date(Date.now()+24*3600*1000);
+          else if (text === '+48h') eta = new Date(Date.now()+48*3600*1000);
+          else { const s = textRaw.replace('T',' ').replace('/', '-'); const dt = new Date(s); if (!isNaN(dt.getTime())) eta = dt; }
+        }
+        await setSession(from.id, 'create.photos.wait', { ...(ses.data||{}), eta: eta? eta.toISOString(): null });
+        await tg('sendMessage',{ chat_id: chat.id, text:'Send photos now (any number). When done, send /submit or type skip (will mark “needs photos”).' });
+        return res.send('OK');
+      }
+      if (ses?.state === 'create.photos.wait'){
+        if (text === 'skip'){
+          const d = ses.data || {}; d.needs_photos = true;
+          const id = await createTicket(d, from.id);
+          await clearSession(from.id);
+          const cap = `#${id} • ${upper(d.asset_type||'unspecified')}${d.asset_id? ' '+d.asset_id:''}${d.problem? ' • '+d.problem:''}\nPlan: ${d.plan||'Unspecified'}${d.eta? ' • ETA: '+d.eta:''}\nBy: @${from.username||from.id}`;
+          await toGroup(cap, null);
+          await tg('sendMessage',{ chat_id: chat.id, text:`Ticket #${id} created (needs photos).` });
+          return res.send('OK');
+        }
+        await tg('sendMessage',{ chat_id: chat.id, text:'Send photos, then /submit.' });
         return res.send('OK');
       }
 
-      // CLOSE
-      if (data === 'cmd:close'){
-        const open = await myOpenTickets(from.id);
-        if (!open.length){ await tg('sendMessage',{ chat_id: from.id, text:'No open tickets.' }); return res.send('OK'); }
-        await setSession(from.id, 'close.pick', {});
-        await tg('sendMessage',{ chat_id: from.id, text:'Select ticket to close:', reply_markup: kb(open.map(t=>[btn(`#${t.id} ${t.asset_type} ${t.problem||''}`.trim(), `close:pick:${t.id}`)])) });
-        return res.send('OK');
-      }
-      if (data.startsWith('close:pick:')){
-        const ticket_id = parseInt(data.split(':')[2],10);
-        await setSession(from.id, 'close.photos', { ticket_id, photos: [] });
-        await tg('sendMessage',{ chat_id: from.id, text:`Attach 1–3 completion photos for #${ticket_id} (or Skip). Then press Close again.`, reply_markup: kb([[btn('Skip','close:photos:skip'), btn('Close now','close:submit')]]) });
-        return res.send('OK');
-      }
-      if (data === 'close:photos:skip' || data === 'close:submit'){
-        const ses = await getSession(from.id) || { data:{} };
-        const draft = ses.data || {}; const ticket_id = draft.ticket_id;
-        if (!ticket_id){ await clearSession(from.id); return res.send('OK'); }
-
-        // save photos (if any) as final
-        for (const f of (draft.photos||[])) await addPhoto(ticket_id, f, true, from.id);
-        await updateStatus(ticket_id, 'done', from.id);
-        await supabase.from('tickets').update({ closed_at: nowIso(), closed_by_user_id: String(from.id) }).eq('id', ticket_id);
-        await toGroup(`✅ #${ticket_id} • Closed • by @${from.username||from.id}`, draft.photos?.[0]);
-        await tg('sendMessage',{ chat_id: from.id, text:`Ticket #${ticket_id} closed.` });
-        await clearSession(from.id);
-        return res.send('OK');
-      }
-
-      await tg('answerCallbackQuery',{ callback_query_id: cq.id, text:'OK' });
+      await tg('sendMessage',{ chat_id: chat.id, text: 'Use /start to see commands.' });
       return res.send('OK');
     }
 
     res.send('OK');
-  } catch (e){
+  }catch(e){
     console.log('webhook error', e?.response?.data || e);
     res.send('OK');
   }
 });
 
-// === Hourly reminders endpoint (use cron-job.org to hit /cron hourly) ===
-app.get('/cron', async (_req,res)=>{
+// === Hourly reminders (built-in) ===
+async function remindersTick(){
   try{
-    // skip quiet hours UTC 04–10 if нужно (можно убрать)
-    const h = new Date().getUTCHours(); if (h>=4 && h<=10) return res.json({ ok:true, skipped:'quiet_hours' });
-
+    const h = new Date().getUTCHours();
+    if (h>=4 && h<=10) return; // quiet hours
     const { data: rows } = await supabase.from('tickets')
-      .select('id, asset_type, problem, eta, owner_user_id, last_reminded_at, snooze_until, status')
+      .select('id, asset_type, asset_id, problem, eta, owner_user_id, last_reminded_at, snooze_until, status')
       .neq('status','done').order('id', { ascending:false }).limit(200);
 
     const due = (rows||[]).filter(t=>{
@@ -378,24 +374,23 @@ app.get('/cron', async (_req,res)=>{
     for (const t of due){
       await tg('sendMessage', {
         chat_id: t.owner_user_id,
-        text: `Update for ticket #${t.id} (${t.asset_type}${t.problem? ' • '+t.problem:''})${t.eta? ' • ETA: '+t.eta:''}?`,
-        reply_markup: kb([
-          [btn('In progress',`upd:quick:${t.id}:in_progress`), btn('Awaiting parts',`upd:quick:${t.id}:awaiting_parts`)],
-          [btn('Done',`upd:quick:${t.id}:done`), btn('Snooze 2h',`upd:quick:${t.id}:snooze`)],
-          [btn('Change ETA',`upd:quick:${t.id}:eta`), btn('Add photos',`upd:quick:${t.id}:photos`)]
-        ])
+        text: `Update ticket #${t.id} (${t.asset_type}${t.asset_id? ' '+t.asset_id:''}${t.problem? ' • '+t.problem:''})${t.eta? ' • ETA: '+t.eta:''}\n` +
+              `Reply with:\n` +
+              `- /status ${t.id} in_progress | awaiting_parts | vendor_scheduled | done\n` +
+              `- /eta ${t.id} YYYY-MM-DD HH:MM | +24h | +48h\n` +
+              `- /snooze ${t.id} 2\n` +
+              `- /addphoto ${t.id} then send photo`
       });
       await supabase.from('tickets').update({ last_reminded_at: nowIso() }).eq('id', t.id);
       await sleep(150);
     }
-    res.json({ ok:true, sent: due.length });
-  }catch(e){
-    console.log('cron error', e?.response?.data || e);
-    res.json({ ok:false });
-  }
-});
+  }catch(e){ console.log('remindersTick error', e?.response?.data || e); }
+}
 
-// Health
+setTimeout(()=>{ remindersTick(); setInterval(remindersTick, 60*60*1000); }, 2*60*1000);
+app.get('/cron', async (_req,res)=>{ await remindersTick(); res.json({ ok:true }); });
+
+// health
 app.get('/', (_req,res)=> res.json({ ok:true, service:'fleet-repair-bot', time: nowIso() }));
 
 const PORT = process.env.PORT || 3000;
